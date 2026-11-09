@@ -10,15 +10,24 @@
  * @license   https://github.com/openemr/openemr/blob/master/LICENSE GNU General Public License 3
  */
 
+$sessionAllowWrite = true;
 require_once dirname(__DIR__, 4) . "/globals.php";
 
 use OpenEMR\Common\Acl\AclMain;
 use OpenEMR\Core\Header;
 use Juggernaut\Module\Bamboo\Controllers\PatientDataRequestMinXmlBuilder;
 use Juggernaut\Module\Bamboo\Controllers\GatewayRequests;
+use Juggernaut\Module\Bamboo\Controllers\ReportAccess;
+use Juggernaut\Module\Bamboo\Controllers\PdmpChartEntry;
 
-if (empty($_SESSION['pid'])) {
-    die('No patient id set');
+header('Cache-Control: no-store');
+header('Referrer-Policy: no-referrer');
+try {
+    $context = ReportAccess::context();
+    $csrf = ReportAccess::csrf();
+} catch (Throwable $error) {
+    ReportAccess::fail($error);
+    exit;
 }
 
 $xmlBuilderMin = new PatientDataRequestMinXmlBuilder();
@@ -26,13 +35,36 @@ $gatewayRequests = new GatewayRequests($xmlBuilderMin);
 $gatewayRequests->url = "https://mutualauth.pmpgateway.net/v5_1/patient";
 
 //fetching the report data
-$report = $gatewayRequests->fetchReportData($gatewayRequests->url);
+try {
+    $report = $gatewayRequests->fetchReportData($gatewayRequests->url);
 
 //return results
 libxml_use_internal_errors(TRUE);
-$simpleXml = simplexml_load_string($report);
+if (str_contains($report, '<!DOCTYPE')) throw new RuntimeException();
+$simpleXml = simplexml_load_string($report, 'SimpleXMLElement', LIBXML_NONET);
 $objXmlDocument = json_encode($simpleXml);
 $arrOutput = json_decode($objXmlDocument, TRUE);
+$reportRef = null;
+if (isset($arrOutput['Report']['ReportRequestURLs']['ViewableReport'])) {
+    $reportRef = ReportAccess::issue($arrOutput['Report']['ReportRequestURLs']['ViewableReport'], 'request', $context);
+}
+} catch (Throwable $error) {
+    ReportAccess::fail($error);
+    exit;
+}
+
+// Every successful lookup is documented in the chart. A recording failure is
+// shown to the clinician rather than hiding the scores.
+$chartNoteId = null;
+$chartError = false;
+if (is_array($arrOutput) && isset($arrOutput['Report']) && !isset($arrOutput['Error'])) {
+    try {
+        $chartNoteId = PdmpChartEntry::record($context, $arrOutput);
+    } catch (Throwable $error) {
+        $chartError = true;
+        error_log('Bamboo PDMP chart entry failed: ' . get_class($error));
+    }
+}
 
 ?>
 <html>
@@ -52,14 +84,6 @@ $arrOutput = json_decode($objXmlDocument, TRUE);
                     <i id="advanced-tooltip" class="fa fa-undo fa-2x" aria-hidden="true"></i></a><?php xlt('Back') ?>
             </div>
             <?php
-            if (!AclMain::aclCheckCore('patients', 'med', '', array('write','addonly'))):  ?>
-                <div class="row">
-                    <div class="col-sm-12">
-                        what is this
-                    </div>
-                </div>
-            <?php  endif; ?>
-            <?php
             if (!$arrOutput) {
                 echo "<p>" . xlt("Bamboo not authorized - return to dashboard") . "</p>";
                 echo "</div></body>\n</html>\n";
@@ -78,19 +102,32 @@ $arrOutput = json_decode($objXmlDocument, TRUE);
                     <th><?php echo xlt("Score") ?></th>
                 </tr>
                 <?php
-                foreach ($arrOutput['Report']['NarxScores']['Score'] as $narxScore) {
+                foreach (PdmpChartEntry::scores($arrOutput) as $narxScore) {
                     echo "<tr>";
-                    echo "<td>" . text($narxScore['ScoreType']) . "</td>";
-                    echo "<td>" . text($narxScore['ScoreValue']) . "</td>";
+                    echo "<td>" . text($narxScore['type']) . "</td>";
+                    echo "<td>" . text($narxScore['value']) . "</td>";
                     echo "</tr>";
                 }
                 ?>
             </table>
+            <?php if ($chartNoteId !== null): ?>
+            <div class="alert alert-info">
+                <?php echo xlt('This check was recorded in the chart (patient notes, PDMP Check).'); ?>
+                <button class="btn btn-sm btn-outline-success ml-2" id="reviewed-btn" onclick="markReviewed()"><?php echo xlt('Reviewed, no concerns'); ?></button>
+                <span id="reviewed-msg" hidden><?php echo xlt('Recorded as reviewed.'); ?></span>
+                <span id="reviewed-error" role="alert" hidden><?php echo xlt('Could not record the review. Try again.'); ?></span>
+            </div>
+            <?php elseif ($chartError): ?>
+            <div class="alert alert-warning" role="alert"><?php echo xlt('This check could not be recorded in the chart. Document it in the visit note.'); ?></div>
+            <?php endif; ?>
             <h3><?php echo xlt("Report Exp") ?></h3>
-            <p><?php echo $arrOutput['Report']['ReportExpiration'] ?></p>
-            <p class="m-3"><?php echo $arrOutput['Report']['Message'] ?></p>
+            <p><?php echo text($arrOutput['Report']['ReportExpiration'] ?? '') ?></p>
+            <p class="m-3"><?php echo text($arrOutput['Report']['Message'] ?? '') ?></p>
             <h3><?php echo xlt("Full Report") ?></h3>
+            <?php if ($reportRef !== null): ?>
             <p><button class="btn btn-primary" onclick="requestFullReport()"><?php echo xlt("Request Full Report") ?></button> </p>
+            <?php endif; ?>
+            <p id="report-error" role="alert" hidden><?php echo xlt('Report unavailable. Reload patient history or contact your administrator.'); ?></p>
             <h3><?php echo xlt("Disclaimer") ?></h3>
             <p><?php echo xlt($arrOutput['Disclaimer']) ?></p>
         </div>
@@ -98,22 +135,50 @@ $arrOutput = json_decode($objXmlDocument, TRUE);
 
 </div><!--end of container div -->
 <script>
-    //adding this as a warning message that is not visible to the user
-    async function requestFullReport() {
-        const url = "<?php echo $arrOutput['Report']['ReportRequestURLs']['ViewableReport']; ?>";
+    async function markReviewed() {
+        const button = document.getElementById('reviewed-btn');
+        button.disabled = true;
+        try {
+            const response = await fetch('reviewNoConcerns.php', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: new URLSearchParams({
+                    note_id: <?php echo json_encode((string)$chartNoteId); ?>,
+                    csrf_token_form: <?php echo json_encode($csrf); ?>
+                })
+            });
+            if (!response.ok) throw new Error('not recorded');
+            button.hidden = true;
+            document.getElementById('reviewed-msg').hidden = false;
+        } catch (_) {
+            button.disabled = false;
+            document.getElementById('reviewed-error').hidden = false;
+        }
+    }
 
-        fetch('fetchFullReport.php', {
+    async function requestFullReport() {
+        // Open synchronously to preserve the user gesture; no vendor URL comes from the browser.
+        const reportWindow = window.open('about:blank', '_blank');
+        if (reportWindow) reportWindow.opener = null;
+        try {
+        const response = await fetch('fetchFullReport.php', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/x-www-form-urlencoded',
             },
-            body: 'url=' + url
-        })
-            .then(response => response.text())
-            .then(data => {
-                console.log(data);
-                window.open(data, '_blank');
-            });
+            body: new URLSearchParams({
+                report_ref: <?php echo json_encode($reportRef); ?>,
+                csrf_token_form: <?php echo json_encode($csrf); ?>
+            })
+        });
+        if (!response.ok) throw new Error('Report unavailable');
+        const link = await response.text(); // Server validates the vendor origin.
+        if (reportWindow) reportWindow.location.replace(link);
+        else window.location.assign(link);
+        } catch (_) {
+            if (reportWindow) reportWindow.close();
+            document.getElementById('report-error').hidden = false;
+        }
     }
 </script>
 </body>

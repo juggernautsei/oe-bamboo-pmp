@@ -19,13 +19,16 @@ OpenEMR custom module for Bamboo Health prescription drug monitoring (PMP/PDMP) 
 
 ## Certificate
 
-Place your vendor-issued client certificate at:
+Bamboo's client certificate holds a private key, so the module refuses to load it from its own
+source tree. Provision it in protected site storage with owner-only permissions (`chmod 600`):
 
 ```text
-certificate/certificate.pfx
+sites/default/documents/.practice/bamboo-client.p12
 ```
 
-This path is gitignored. Never commit keystores or passphrases.
+Set `BAMBOO_PMP_CERT_FILE` to use another location outside the module. Requests are refused when
+the file is missing, inside the module, or readable by group or others. Never commit keystores or
+passphrases.
 
 ## Installation
 
@@ -36,6 +39,42 @@ git clone https://github.com/juggernautsei/oe-bamboo-pmp.git
 
 Register and enable in Module Manager. Configure credentials and certificate on the server outside of source control.
 
+## Report request boundary
+
+Deploy the report pages and controllers together. The normal **Request Full
+Report** flow remains: patient history obtains a vendor report request, then the
+browser opens the validated final vendor link. The browser now submits a random
+`report_ref` and native `csrf_token_form`, not a URL. References are held in the
+native session, bound to the user and selected patient, and expire after 15
+minutes (at most 20 per session). Reload patient history after expiry.
+
+Both report POST endpoints require the selected patient's medical-record
+permission (`patients/med` write or add-only, as intended by the existing history
+page) and squad access. The initial history request checks these before contacting
+Bamboo. OpenEMR 7.x session/CSRF APIs and 8.x session wrappers are supported.
+
+Only exact HTTPS hosts documented by Bamboo are accepted; other schemes, userinfo,
+nonstandard ports, malformed URLs and redirects are refused before report data or
+credentials are sent. The conflicting fixed pre-production Host header is removed.
+See [Bamboo's Gateway host documentation](https://ssltls.bamboohealth.com/pmpgateway-cert-update-2025.html).
+No arbitrary host override is accepted from a browser request.
+
+The optional `getReportContents.php` helper also requires a session-bound display
+reference, returned by `fetchFullReport.php` in `X-Bamboo-Report-Reference`, plus
+CSRF. Its HTML response is sandboxed. Existing raw-URL callers must migrate; the
+shipped UI opens the final vendor link directly and does not use that helper.
+URLs, report XML and vendor errors are not written to debug files or browser logs.
+
+Run the offline regression suite with `composer test`, or:
+
+```bash
+php tests/report-boundary.php
+php tests/report-boundary.php --wrapped
+```
+
+These tests exercise actual module helpers and transports with inert native API
+and network substitutes. They are not live vendor/certificate acceptance.
+
 ## License
 
 This module is released under the **GNU General Public License v3.0** (GPL-3.0-only), consistent with OpenEMR.  
@@ -45,3 +84,17 @@ See [LICENSE](LICENSE).
 
 Sherwin Gaddis / Juggernaut Systems Enterprise  
 https://github.com/juggernautsei/oe-bamboo-pmp
+
+### PDMP chart receipts
+
+A successful lookup records the checking clinician, time, scores and expiry.
+Its **report snapshot reference** is SHA-256 of the decoded gateway `Report`
+serialized with PHP `JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES`. It is an audit
+fingerprint, not a vendor identifier or a report retrieval link. The report URL
+and full report are not copied into the note; reopening still uses the existing
+short-lived, clinician/patient-bound session flow. This module does not save the
+full report automatically or provide a new full-report attachment action.
+
+`composer test` covers receipt fingerprints, link exclusion and failed review
+writes. `tests/native-pdmp-chart-entry.php` is an opt-in synthetic local database
+check (`PDMP_CHART_NATIVE=1`), not a vendor lookup. It deletes its temporary note.
